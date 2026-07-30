@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>NEON SURVIVOR · 霓虹幸存者</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path d="M32 6 L54 54 L32 42 L10 54 Z" fill="none" stroke="%237ef9ff" stroke-width="5" stroke-linejoin="round"/></svg>'>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<canvas id="game"></canvas>
+
+<div id="scanlines"></div>
+<div id="vignette"></div>
+<div id="flash"></div>
+<div id="announce"></div>
+
+<!-- HUD -->
+<div id="hud" class="hidden">
+  <div id="hud-tl">
+    <div class="hud-row">
+      <div id="level-badge"><span>LV</span><b id="level-num">1</b></div>
+      <div class="bars">
+        <div class="bar hp"><div class="fill" id="hp-fill"></div><span class="bar-text" id="hp-text">100 / 100</span></div>
+        <div class="bar xp"><div class="fill" id="xp-fill"></div></div>
+      </div>
+    </div>
+    <div id="weapons-row"></div>
+  </div>
+  <div id="hud-tc">
+    <div id="wave-label">WAVE 1</div>
+    <div id="timer">00:00</div>
+    <div id="boss-bar" class="hidden">
+      <div id="boss-fill"></div>
+      <span class="boss-name">VOID SENTINEL · 虚空哨兵</span>
+    </div>
+  </div>
+  <div id="hud-tr">
+    <div id="score">0</div>
+    <div id="combo" class="hidden">连击 ×0</div>
+  </div>
+  <div id="hud-tr2">
+    <div class="p2-tag">P2 · 客机</div>
+    <div class="p2-hp"><div class="fill" id="p2-hp-fill"></div></div>
+    <div class="p2-info"><span id="p2-hp-text">100</span> · LV<span id="p2-level">1</span></div>
+  </div>
+  <div id="joystick"><div id="stick"></div></div>
+  <button id="dashBtn">冲刺</button>
+</div>
+
+<!-- 开始界面 -->
+<div class="screen hidden" id="screen-start">
+  <div class="title-wrap">
+    <div id="title-zh">霓 虹 幸 存 者</div>
+    <div id="title-en">NEON&nbsp;SURVIVOR</div>
+    <div id="subtitle">— 虚空深处 · 生存协议 —</div>
+  </div>
+  <div id="best-line">最佳纪录 <b id="best-score">0</b></div>
+  <button class="btn big" id="btn-start">进 入 虚 空</button>
+  <div class="controls-grid">
+    <div><kbd>鼠标移动</kbd><span>移动方向</span></div>
+    <div><kbd>左键 / SPACE</kbd><span>相位冲刺</span></div>
+    <div><kbd>AUTO</kbd><span>自动索敌开火</span></div>
+    <div><kbd>P / ESC</kbd><span>暂停</span></div>
+    <div><kbd>M</kbd><span>静音</span></div>
+  </div>
+  <div id="credits">纯 Web 技术 · 程序化霓虹美术与音效 · 字体 Orbitron / Rajdhani (OFL)</div>
+</div>
+
+<!-- 联机大厅 -->
+<div class="screen" id="screen-lobby">
+  <div class="lobby-box">
+    <div id="lobby-title">◤ 局 域 网 联 机 ◢</div>
+    <div id="lobby-status">等待操作…</div>
+    <div id="lobby-code-box" class="hidden">
+      <div class="code-label">房间码</div>
+      <div id="lobby-code">----</div>
+      <div class="code-hint">告诉客机输入此码</div>
+    </div>
+    <div class="lobby-btns">
+      <button class="btn small" id="btn-host">创建房间</button>
+      <button class="btn small" id="btn-join-show">加入房间</button>
+    </div>
+    <div id="join-row" class="ip-row hidden">
+      <input type="text" id="room-input" placeholder="输入房间码" maxlength="4" autocomplete="off">
+      <button class="btn small" id="btn-join-go">加入</button>
+    </div>
+    <button class="btn small ghost" id="btn-solo">单 人 模 式</button>
+  </div>
+</div>
+
+<!-- 升级选择 -->
+<div class="screen hidden" id="screen-levelup">
+  <div class="lvl-title">◤ 升 级 · 选 择 强 化 ◢</div>
+  <div id="cards"></div>
+  <div class="lvl-hint">点击卡片或按 <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> 选择</div>
+</div>
+
+<!-- 结算 -->
+<div class="screen hidden" id="screen-over">
+  <div id="over-title">信 号 丢 失</div>
+  <div id="record-badge" class="hidden">★ 新纪录 ★</div>
+  <div class="stats">
+    <div class="stat"><span>存活时间</span><b id="stat-time">00:00</b></div>
+    <div class="stat"><span>到达波次</span><b id="stat-wave">1</b></div>
+    <div class="stat"><span>等级</span><b id="stat-level">1</b></div>
+    <div class="stat"><span>击杀</span><b id="stat-kills">0</b></div>
+    <div class="stat"><span>最高连击</span><b id="stat-combo">0</b></div>
+    <div class="stat score"><span>总分</span><b id="stat-score">0</b></div>
+    <div class="stat"><span>历史最佳</span><b id="stat-best">0</b></div>
+  </div>
+  <button class="btn big" id="btn-retry">再 次 出 击</button>
+</div>
+
+<!-- 暂停 -->
+<div class="screen hidden" id="screen-pause">
+  <div id="pause-title">已 暂 停</div>
+  <button class="btn" id="btn-resume">继 续</button>
+  <button class="btn ghost" id="btn-restart">重新开始</button>
+</div>
+
+<script src="js/net.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/input.js"></script>
+<script src="js/particles.js"></script>
+<script src="js/world.js"></script>
+<script src="js/entities.js"></script>
+<script src="js/weapons.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/game.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
