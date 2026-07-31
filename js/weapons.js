@@ -320,20 +320,39 @@ const WeaponSys = {
 
 /* ---------------- 升级选项 ---------------- */
 function rollUpgrades() {
-  const opts = [];
+  const pool = [];
+  // 武器强化：权重 3（攻击提升类优先）
   for (const w of player.weapons) {
-    if (w.lv < WEAPONS[w.key].max) opts.push({ kind: 'wup', key: w.key });
+    if (w.lv < WEAPONS[w.key].max) pool.push({ v: { kind: 'wup', key: w.key }, w: 3 });
   }
+  // 新武器：权重 1
   if (player.weapons.length < 5) {
     for (const k in WEAPONS) {
-      if (!WeaponSys.get(k)) opts.push({ kind: 'wnew', key: k });
+      if (!WeaponSys.get(k)) pool.push({ v: { kind: 'wnew', key: k }, w: 1 });
     }
   }
+  // 被动：权重 1（基础概率）
   for (const k in PASSIVES) {
-    if ((player.passives[k] || 0) < PASSIVES[k].max) opts.push({ kind: 'p', key: k });
+    if ((player.passives[k] || 0) < PASSIVES[k].max) pool.push({ v: { kind: 'p', key: k }, w: 1 });
   }
-  U.shuffle(opts);
-  const picked = opts.slice(0, 3);
+
+  // 加权不放回抽取 3 个选项
+  const picked = [];
+  const remaining = pool.slice();
+  while (picked.length < 3 && remaining.length > 0) {
+    const idx = (() => {
+      let tot = 0;
+      for (const it of remaining) tot += it.w;
+      let r = Math.random() * tot;
+      for (let i = 0; i < remaining.length; i++) {
+        r -= remaining[i].w;
+        if (r <= 0) return i;
+      }
+      return remaining.length - 1;
+    })();
+    picked.push(remaining[idx].v);
+    remaining.splice(idx, 1);
+  }
   while (picked.length < 3) picked.push({ kind: 'heal' });
   picked.forEach((o, i) => { o._idx = i; });
   return picked;
