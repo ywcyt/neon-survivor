@@ -2,19 +2,27 @@
 /* ============ 实体：玩家 / 敌人 / 子弹 / 宝石 / 掉落 ============ */
 let player = null;
 const enemies = [];
-const bullets = [];
+const bullets = [];        // 权威子弹（主机：双方；客机：仅远端 P1，由快照管理）
+const localBullets = [];   // 客机自机本地发射的子弹（纯视觉反馈，快照不覆盖）
 const ebullets = [];
 const gems = [];
 const pickups = [];
-const missiles = [];
+const missiles = [];       // 权威飞弹（主机：双方；客机：仅远端 P1）
+const localMissiles = [];  // 客机自机本地飞弹（纯视觉）
+let fireFromP2 = false;    // 主机更新 P2 武器时置真，用于给子弹/飞弹打上归属标记
+let _nextId = 1;
+function nextId() { return _nextId++; }   // 实体稳定 id：客机按 id 复用，避免 swap-pop 造成插值对象串位
 
 function resetEntities() {
   enemies.length = 0;
   bullets.length = 0;
+  localBullets.length = 0;
   ebullets.length = 0;
   gems.length = 0;
   pickups.length = 0;
   missiles.length = 0;
+  localMissiles.length = 0;
+  fireFromP2 = false;
 }
 
 function xpFor(lv) {
@@ -281,12 +289,12 @@ function updateGemsMulti(dt) {
       g.vx = Math.cos(a) * spd; g.vy = Math.sin(a) * spd;
     }
     g.x += g.vx * dt; g.y += g.vy * dt;
-    // 检查两个玩家
+    // 检查两个玩家（经验归属对应玩家，P2 的升级给 P2）
     let collected = false;
     for (const pp of _PLAYERS) {
       if (!pp || !pp.alive) continue;
       if (U.dist2(g.x, g.y, pp.x, pp.y) < 22 * 22) {
-        Game.collectGem(g); collected = true; break;
+        Game.collectGem(g, pp); collected = true; break;
       }
     }
     if (collected) { gems[i] = gems[gems.length - 1]; gems.pop(); }
@@ -300,7 +308,7 @@ function updatePickupsMulti(dt) {
     for (const pp of _PLAYERS) {
       if (!pp || !pp.alive) continue;
       if (U.dist2(pk.x, pk.y, pp.x, pp.y) < 28 * 28) {
-        Game.applyPickup(pk.type, pk.x, pk.y);
+        Game.applyPickup(pk.type, pk.x, pk.y, pp);
         // swap-and-pop 替代 O(n) splice
         pickups[i] = pickups[pickups.length - 1];
         pickups.pop();
@@ -346,6 +354,7 @@ function spawnEnemy(type, x, y, elite = false, hpMul = 1, dmgMul = 1) {
     atk: null, last: null,
   };
   e.maxHp = e.hp;
+  e.id = nextId();
   enemies.push(e);
   // 通知 Game 空间哈希已过期（分裂/召唤产生的敌人不在哈希内）
   if (typeof Game !== 'undefined') Game._hashDirty = true;
@@ -696,10 +705,26 @@ function drawEnemies(ctx) {
 
 /* ---------------- 玩家子弹 ---------------- */
 function spawnBullet(x, y, vx, vy, dmg, pierce, col = '#7ef9ff') {
-  bullets.push({ x, y, vx, vy, dmg, pierce, r: 4, life: 1.15, col, hit: null });
+  if (Game.mode === 'guest') {
+    // 客机：自机子弹走本地数组（快照不覆盖，保证开火反馈即时）
+    localBullets.push({ x, y, vx, vy, dmg, pierce, r: 4, life: 1.15, col, hit: null });
+  } else {
+    bullets.push({ x, y, vx, vy, dmg, pierce, r: 4, life: 1.15, col, hit: null, p2: fireFromP2, id: nextId() });
+  }
 }
 
-function updateBullets(dt) {
+/** 子弹更新。
+ *  主机：完整生命周期（推进+清除，含 P2 标记子弹，伤害权威）。
+ *  客机 remoteOnly：仅推进远端子弹位置（快照间按速度推算，删除由快照管理）。 */
+function updateBullets(dt, remoteOnly = false) {
+  if (remoteOnly) {
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+    }
+    return;
+  }
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     b.life -= dt;
@@ -708,6 +733,20 @@ function updateBullets(dt) {
     if (b.life <= 0 || b.x < 0 || b.x > World.W || b.y < 0 || b.y > World.H) {
       bullets[i] = bullets[bullets.length - 1];
       bullets.pop();
+    }
+  }
+}
+
+/** 客机本地子弹：完整生命周期（推进+清除），纯视觉 */
+function updateLocalBullets(dt) {
+  for (let i = localBullets.length - 1; i >= 0; i--) {
+    const b = localBullets[i];
+    b.life -= dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.life <= 0 || b.x < 0 || b.x > World.W || b.y < 0 || b.y > World.H) {
+      localBullets[i] = localBullets[localBullets.length - 1];
+      localBullets.pop();
     }
   }
 }
@@ -728,6 +767,21 @@ function drawBullets(ctx) {
     ctx.lineTo(b.x + nx * 3, b.y + ny * 3);
     ctx.stroke();
   }
+  // 客机自机本地子弹
+  for (let i = 0, len = localBullets.length; i < len; i++) {
+    const b = localBullets[i];
+    const s = 26;
+    ctx.globalAlpha = 0.85;
+    ctx.drawImage(glowSprite(b.col), b.x - s / 2, b.y - s / 2, s, s);
+    const l = Math.hypot(b.vx, b.vy) || 1;
+    const nx = b.vx / l, ny = b.vy / l;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(b.x - nx * 10, b.y - ny * 10);
+    ctx.lineTo(b.x + nx * 3, b.y + ny * 3);
+    ctx.stroke();
+  }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
 }
@@ -735,10 +789,19 @@ function drawBullets(ctx) {
 /* ---------------- 敌方子弹 ---------------- */
 function spawnEBullet(x, y, vx, vy, dmg, col = '#ff5ecf', r = 6) {
   if (ebullets.length > 400) return;
-  ebullets.push({ x, y, vx, vy, dmg, col, r, life: 7 });
+  ebullets.push({ x, y, vx, vy, dmg, col, r, life: 7, id: nextId() });
 }
 
-function updateEBullets(dt) {
+/** 敌方子弹。主机：完整生命周期；客机 remoteOnly：仅按速度推进（快照间推算） */
+function updateEBullets(dt, remoteOnly = false) {
+  if (remoteOnly) {
+    for (let i = ebullets.length - 1; i >= 0; i--) {
+      const b = ebullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+    }
+    return;
+  }
   for (let i = ebullets.length - 1; i >= 0; i--) {
     const b = ebullets[i];
     b.life -= dt;
@@ -772,15 +835,44 @@ function drawEBullets(ctx) {
 
 /* ---------------- 追踪飞弹 ---------------- */
 function spawnMissile(x, y, angle, dmg, aoe) {
-  missiles.push({
-    x, y,
-    vx: Math.cos(angle) * 300, vy: Math.sin(angle) * 300,
-    dmg, aoe, target: randomEnemyNear(x, y, 900),
-    life: 4, trailT: 0,
-  });
+  if (Game.mode === 'guest') {
+    // 客机：自机飞弹走本地数组（纯视觉，伤害由主机结算）
+    localMissiles.push({
+      x, y,
+      vx: Math.cos(angle) * 300, vy: Math.sin(angle) * 300,
+      dmg, aoe, target: randomEnemyNear(x, y, 900),
+      life: 4, trailT: 0,
+    });
+  } else {
+    missiles.push({
+      x, y,
+      vx: Math.cos(angle) * 300, vy: Math.sin(angle) * 300,
+      dmg, aoe, target: randomEnemyNear(x, y, 900),
+      life: 4, trailT: 0, p2: fireFromP2, id: nextId(),
+    });
+  }
 }
 
-function updateMissiles(dt) {
+/** 飞弹更新。主机：完整生命周期（追踪+爆炸+清除）。 */
+function updateMissiles(dt, remoteOnly = false) {
+  if (remoteOnly) {
+    // 客机：远端飞弹仅本地追踪+推进位置（删除由快照管理，快照刷新航向）
+    for (let i = missiles.length - 1; i >= 0; i--) {
+      const m = missiles[i];
+      if (!m.target || m.target.dead) m.target = nearestEnemy(m.x, m.y);
+      if (m.target) {
+        const want = U.angleTo(m.x, m.y, m.target.x, m.target.y);
+        const cur = Math.atan2(m.vy, m.vx);
+        const a = U.lerpAngle(cur, want, Math.min(1, dt * 6.5));
+        const spd = Math.min(560, Math.hypot(m.vx, m.vy) + 620 * dt);
+        m.vx = Math.cos(a) * spd;
+        m.vy = Math.sin(a) * spd;
+      }
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+    }
+    return;
+  }
   for (let i = missiles.length - 1; i >= 0; i--) {
     const m = missiles[i];
     m.life -= dt;
@@ -816,9 +908,69 @@ function updateMissiles(dt) {
   }
 }
 
+/** 客机本地飞弹：完整生命周期（追踪+爆炸+清除），纯视觉 */
+function updateLocalMissiles(dt) {
+  for (let i = localMissiles.length - 1; i >= 0; i--) {
+    const m = localMissiles[i];
+    m.life -= dt;
+    if (!m.target || m.target.dead) m.target = nearestEnemy(m.x, m.y);
+    if (m.target) {
+      const want = U.angleTo(m.x, m.y, m.target.x, m.target.y);
+      const cur = Math.atan2(m.vy, m.vx);
+      const a = U.lerpAngle(cur, want, Math.min(1, dt * 6.5));
+      const spd = Math.min(560, Math.hypot(m.vx, m.vy) + 620 * dt);
+      m.vx = Math.cos(a) * spd;
+      m.vy = Math.sin(a) * spd;
+    }
+    m.x += m.vx * dt;
+    m.y += m.vy * dt;
+    m.trailT -= dt;
+    if (m.trailT <= 0) {
+      m.trailT = 0.022;
+      FX.trail(m.x, m.y, '#ffb454', 3.4, 0.28);
+    }
+    let boom = m.life <= 0;
+    if (m.target && !m.target.dead &&
+        U.dist2(m.x, m.y, m.target.x, m.target.y) < (m.target.r + 10) * (m.target.r + 10)) {
+      boom = true;
+    }
+    if (boom) {
+      FX.explosion(m.x, m.y, '#ffb454', 0);
+      AudioSys.explode(0);
+      localMissiles[i] = localMissiles[localMissiles.length - 1];
+      localMissiles.pop();
+    }
+  }
+}
+
 function drawMissiles(ctx) {
   for (let i = 0, len = missiles.length; i < len; i++) {
     const m = missiles[i];
+    const a = Math.atan2(m.vy, m.vx);
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(a);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.85;
+    ctx.drawImage(glowSprite('#ffb454'), -14, -14, 28, 28);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(9, 0);
+    ctx.lineTo(-6, -4);
+    ctx.lineTo(-3.5, 0);
+    ctx.lineTo(-6, 4);
+    ctx.closePath();
+    ctx.fillStyle = '#2b1a06';
+    ctx.fill();
+    ctx.strokeStyle = '#ffb454';
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+    ctx.restore();
+  }
+  // 客机自机本地飞弹
+  for (let i = 0, len = localMissiles.length; i < len; i++) {
+    const m = localMissiles[i];
     const a = Math.atan2(m.vy, m.vx);
     ctx.save();
     ctx.translate(m.x, m.y);
@@ -856,7 +1008,7 @@ function spawnGem(x, y, val) {
   // 上限保护：超限丢弃新宝石（swap-pop 删除与环形覆盖会互相冲突，故只 push）
   if (gems.length >= 381) return;
   gems.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
-    val, tier, mag: false, phase: U.rand(TAU) });
+    val, tier, mag: false, phase: U.rand(TAU), id: nextId() });
 }
 
 function dropGems(x, y, total) {
@@ -929,7 +1081,7 @@ function drawGems(ctx) {
 
 /* ---------------- 掉落道具 ---------------- */
 function spawnPickup(x, y, type) {
-  pickups.push({ x, y, type, phase: U.rand(TAU) });
+  pickups.push({ x, y, type, phase: U.rand(TAU), id: nextId() });
 }
 
 function updatePickups(dt) {

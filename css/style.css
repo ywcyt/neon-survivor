@@ -514,3 +514,12 @@ kbd {
   font-family: var(--font-num); font-size: 11px; color: rgba(255,200,220,0.7);
   letter-spacing: 2px;
 }
+
+/* 升级等待卡片（联机：本轮属于对方） */
+.card-wait {
+  pointer-events: none; cursor: default;
+  min-height: 160px; justify-content: center;
+  border-style: dashed; opacity: 0.75;
+  animation: none;
+}
+.card-wait .card-name { font-size: 15px; letter-spacing: 3px; color: rgba(216,232,255,0.85); }

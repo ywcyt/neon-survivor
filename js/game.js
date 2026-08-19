@@ -9,7 +9,7 @@ const SNAP_COL_NAMES = ['#ff5ecf', '#59f0ff', '#ffb454'];
 function snapWeapons(p) { return p.weapons.map(w => [w.key, w.lv, w.rot, w.cd]); }
 function snapPlayer(p) {
   return [p.x | 0, p.y | 0, Math.ceil(p.hp), p.maxHp, p.alive ? 1 : 0,
-    p.iTime > 0 ? 1 : 0, Math.round(p.level)];
+    p.iTime > 0 ? 1 : 0, Math.round(p.level), p.xp | 0, p.xpNext | 0];
 }
 
 const Game = {
@@ -27,7 +27,11 @@ const Game = {
   _uiTick: 0,
   CELL: 96,
   // 多人模式
-  mode: 'solo', p2: null, _snapTick: 0, _remoteSnap: null, _levelUpPlayer: 0,
+  mode: 'solo', p2: null, _snapTick: 0, _remoteSnap: null,
+  _levelUpPlayer: 0, _levelQueue: [], _levelOpts: null,   // 升级归属队列（0=P1 1=P2）+ 当前轮选项
+  // 客机实体池：按稳定 id 复用，保证插值身份一致（主机 swap-pop 不串位）
+  _enemyPool: new Map(), _bulletPool: new Map(), _ebulletPool: new Map(),
+  _gemPool: new Map(), _missilePool: new Map(), _pickupPool: new Map(),
 
   init() {
     try {
@@ -75,31 +79,24 @@ const Game = {
       if (Net.mode === 'guest') this.startGuest();
     };
     Net.onRemoteLevelUp = (msg) => {
-      if (Net.mode === 'guest' && msg.cards) {
+      if (Net.mode === 'guest') {
         this.state = 'levelup';
         AudioSys.levelup(); AudioSys.duck(0.12);
-        // 用主机发来的卡片数据构建选项
-        const opts = msg.cards.map((c, i) => ({ _lvCard: c, _idx: i }));
-        UI.showUpgradesRemote(opts);
+        if (msg.cards && msg.cards.length) {
+          // 自己的升级轮：直接渲染主机发来的卡片元数据
+          UI.showUpgradesRemote(msg.cards);
+        } else {
+          // 主机（P1）的升级轮：显示等待提示
+          UI.showWaiting('主机正在选择升级…');
+        }
       }
     };
     Net.onRemoteLevelPick = (i) => {
       if (Net.mode === 'host') {
-        const opts = UI._curOpts;
+        const opts = this._levelOpts;   // 当前轮选项（独立于 UI 显示状态，等待提示时也有效）
         if (opts && opts[i]) {
           AudioSys.uiClick();
-          applyUpgrade(opts[i]);
-          if (this.pendingLevels > 0) {
-            this.pendingLevels--;
-            this.state = 'levelup';
-            AudioSys.levelup();
-            FX.ring(player.x, player.y, '#7ef9ff', 140, 4);
-            const opts2 = rollUpgrades();
-            UI.showUpgrades(opts2);
-          } else {
-            this.state = 'playing'; UI.showScreen(null); AudioSys.duck(0.3);
-            Net.send({ type: 'lvdone' });
-          }
+          this.finishLevelUpPick(opts[i]);
         }
       }
     };
@@ -133,6 +130,7 @@ const Game = {
     this.hitstop = 0; this.timeScale = 1;
     this.boss = null; this.pendingLevels = 0;
     this.pickStreak = 0;
+    this._levelQueue.length = 0; this._levelUpPlayer = 0; this._levelOpts = null;
     AudioSys.intensity = 0;
     UI._cache = {};
     UI.weaponsDirty = true;
@@ -195,14 +193,13 @@ const Game = {
 
     // 多人主机模式走独立更新
     if (this.mode === 'host' && this.p2) { this.updateMultiplayer(rdt); return; }
-    // 客机：发送世界坐标输入 + 本地预测
+    // 客机：发送世界坐标输入 + 本地预测（输入每帧发送，冲刺 peek 不消费，
+    // 保证主机一定能收到；伤害与击杀由主机权威结算，本地只做视觉反馈）
     if (this.mode === 'guest') {
-      if ((Net._inputTick = (Net._inputTick + 1) % 2) === 0) {
-        const mwX = Input.mouseX + World.camX - World.vw / 2;
-        const mwY = Input.mouseY + World.camY - World.vh / 2;
-        Net.send({ type: 'in', mx: mwX, my: mwY, dash: Input.consumeDash() });
-      }
-      // 本地预测 P2 移动 & 武器（即时反馈，主机仍为权威）
+      const mwX = Input.mouseX + World.camX - World.vw / 2;
+      const mwY = Input.mouseY + World.camY - World.vh / 2;
+      Net.send({ type: 'in', mx: mwX, my: mwY, dash: Input.dashQueued });
+      // 本地预测自机移动 & 武器（即时反馈）
       if (this.p2 && this.p2.alive) {
         const origPlayer = player;
         player = this.p2;
@@ -210,9 +207,16 @@ const Game = {
         WeaponSys.update(rdt);
         player = origPlayer;
       }
-      // 更新子弹/飞弹位置（避免快照间冻结）
-      updateBullets(rdt);
-      updateMissiles(rdt);
+      // 远端实体：快照间按速度推算位置（删除由快照管理）
+      updateBullets(rdt, true);
+      updateMissiles(rdt, true);
+      updateEBullets(rdt, true);
+      // 自机本地子弹/飞弹（纯视觉）
+      updateLocalBullets(rdt);
+      updateLocalMissiles(rdt);
+      // 平滑推进快照实体（指数插值）+ 相机跟随平滑后的 P1
+      this.smoothRemote(rdt);
+      if (this._remoteSnap) World.update(rdt, player.x, player.y);
       // 更新本地粒子特效
       FX.update(rdt);
       // 客机 HUD：显示自己的状态（player 是主机 P1，需临时 swap 到自己的船）
@@ -593,28 +597,31 @@ const Game = {
   },
 
   /* ---------- 拾取 ---------- */
-  collectGem(g) {
+  collectGem(g, pp) {
     this.pickStreak++;
     this.pickT = 0.9;
     AudioSys.pickup(this.pickStreak);
     FX.burst(g.x, g.y, GEM_TIERS[g.tier].col, 3, 120, 3, 0.3);
-    this.gainXP(g.val);
+    this.gainXP(g.val, pp);
   },
 
-  gainXP(v) {
-    const p = player;
+  gainXP(v, pp) {
+    const p = pp || player;
     p.xp += v * p.xpMul;
     while (p.xp >= p.xpNext) {
       p.xp -= p.xpNext;
       p.level++;
       p.xpNext = xpFor(p.level);
       this.pendingLevels++;
+      // 记录升级归属：主机模式下 P2 捡的经验升级给 P2
+      if (this.mode === 'host') this._levelQueue.push(p === this.p2 ? 1 : 0);
     }
   },
 
-  applyPickup(type, x, y) {
+  applyPickup(type, x, y, pp) {
+    const p = pp || player;
     if (type === 'heart') {
-      player.hp = Math.min(player.maxHp, player.hp + 30);
+      p.hp = Math.min(p.maxHp, p.hp + 30);
       AudioSys.heart();
       FX.burst(x, y, '#66ffa3', 14, 220, 5, 0.6);
       FX.ring(x, y, '#66ffa3', 60, 3);
@@ -624,7 +631,7 @@ const Game = {
       this.trauma += 0.8;
       this.hitstop = 0.08;
       FX.ring(x, y, '#ffd54d', 420, 8);
-      this.areaDamage(player.x, player.y, 1300, 260, 500);
+      this.areaDamage(p.x, p.y, 1300, 260, 500);
       for (const b of ebullets) FX.burst(b.x, b.y, b.col, 2, 90, 3, 0.3);
       ebullets.length = 0;
     }
@@ -659,11 +666,7 @@ const Game = {
 
     World.drawBackdrop(ctx);
 
-    // 客机：用快照中 P1 位置驱动镜头
-    if (this.mode === 'guest' && this._remoteSnap) {
-      const sp = this._remoteSnap.p[0];
-      if (sp) { World.camX = sp[0]; World.camY = sp[1]; }
-    }
+    // 客机镜头已在 update 中随平滑后的 P1 推进，此处无需硬赋值
 
     ctx.save();
     ctx.translate(Math.round(World.vw / 2 - World.camX + sx), Math.round(World.vh / 2 - World.camY + sy));
@@ -703,11 +706,15 @@ const Game = {
   startHost() {
     this.mode = 'host';
     this.start();
-    // 创建 P2
+    // 创建 P2 并给予初始武器（否则客机无法开火/升级）
     const p = createPlayer();
     p.x = World.W / 2 + 120; p.y = World.H / 2 - 80;
     p.col = '#ff5ecf';
     this.p2 = p;
+    const origP = player;
+    player = p;
+    WeaponSys.add('blaster');
+    player = origP;
     Net.send({ type: 'start', seed: Math.random() });
   },
 
@@ -721,10 +728,12 @@ const Game = {
     this.score = 0; this.kills = 0; this.combo = 0; this.maxCombo = 0;
     this.trauma = 0; this.flash = 0;
     this.boss = null; this.pendingLevels = 0;
+    this._levelQueue.length = 0; this._levelUpPlayer = 0;
     this._remoteSnap = null;
     player = createPlayer();
     this.p2 = createPlayer();
     this.p2.col = '#ff5ecf';
+    this.p2.x = World.W / 2 + 120; this.p2.y = World.H / 2 - 80;   // 与主机 P2 出生点一致，避免开局快照校正跳动
     World.snapCam(player.x, player.y);
     UI.showScreen(null);
     AudioSys.init(); AudioSys.resume(); AudioSys.startMusic(); AudioSys.duck(0.3);
@@ -737,96 +746,153 @@ const Game = {
       t: this.time, w: this.wave, sc: [this.score, this.kills], co: [this.combo, this.maxCombo],
       p: [snapPlayer(player), snapPlayer(this.p2)],
       pw: [snapWeapons(player), snapWeapons(this.p2)],
-      e: [], b: [], eb: [], g: [],
+      e: [], b: [], eb: [], g: [], m: [], pk: [],
       bh: this.boss && !this.boss.dead ? this.boss.hp : 0,
       bm: this.boss && !this.boss.dead ? this.boss.maxHp : 0,
     };
+    // 敌人：r/col 可由 type+elite 推导，不再传输（省带宽+字符串 GC）；携带稳定 id
     for (const e of enemies) {
       if (e.dead) continue;
-      snap.e.push([e.x|0, e.y|0, Math.ceil(e.hp), e.r, SNAP_TYPE_IDX[e.type] || 0, e.elite ? 1 : 0, e.boss ? 1 : 0, e.flash > 0 ? 1 : 0, e.col]);
+      snap.e.push([e.x|0, e.y|0, Math.ceil(e.hp), SNAP_TYPE_IDX[e.type] || 0, e.elite ? 1 : 0, e.boss ? 1 : 0, e.flash > 0 ? 1 : 0, e.id]);
     }
-    for (const b of bullets) snap.b.push([b.x|0, b.y|0, b.vx|0, b.vy|0]);
-    for (const b of ebullets) snap.eb.push([b.x|0, b.y|0, b.vx|0, b.vy|0, b.r, SNAP_COL_IDX[b.col] || 0]);
-    for (const g of gems) snap.g.push([g.x|0, g.y|0, g.tier]);
+    // 子弹/飞弹：跳过 P2 自机发射的（客机本地绘制自己的，避免重复）
+    for (const b of bullets) { if (b.p2) continue; snap.b.push([b.x|0, b.y|0, b.vx|0, b.vy|0, b.id]); }
+    for (const m of missiles) { if (m.p2) continue; snap.m.push([m.x|0, m.y|0, m.vx|0, m.vy|0, m.id]); }
+    for (const b of ebullets) snap.eb.push([b.x|0, b.y|0, b.vx|0, b.vy|0, b.r, SNAP_COL_IDX[b.col] || 0, b.id]);
+    for (const g of gems) snap.g.push([g.x|0, g.y|0, g.tier, g.id]);
+    for (const pk of pickups) snap.pk.push([pk.x|0, pk.y|0, pk.type === 'heart' ? 0 : 1, pk.id]);
     return snap;
   },
 
-  /** 快照应用（客机渲染） */
+  /** 快照应用（客机渲染）
+   *  插值约定：enemies/gems/P1 存 tx/ty 目标，x/y 为平滑显示位置；
+   *  子弹/飞弹/敌方子弹按速度推算（直线弹道精确）；P2 自机信任本地预测。 */
   applySnapshot(snap) {
     this._remoteSnap = snap;
     this.time = snap.t; this.wave = snap.w;
     this.score = snap.sc[0]; this.kills = snap.sc[1];
     this.combo = snap.co[0]; this.maxCombo = snap.co[1];
-    // P1
+    // P1（远端，平滑插值）
     const d1 = snap.p[0];
-    player.x = d1[0]; player.y = d1[1]; player.hp = d1[2]; player.maxHp = d1[3];
+    if (player.tx === undefined) { player.x = d1[0]; player.y = d1[1]; }
+    player.tx = d1[0]; player.ty = d1[1];
+    player.hp = d1[2]; player.maxHp = d1[3];
     player.alive = !!d1[4]; player.iTime = d1[5] ? 0.3 : -1;
-    player.level = d1[6]; player.angle = 0;
-    // P1 weapons（复用对象减少 GC）
+    player.level = d1[6]; player.xp = d1[7] || 0; player.xpNext = d1[8] || player.xpNext;
+    player.angle = 0;
+    // P1 weapons：只同步 key/lv，rot/cd/tick 保留本地（纯视觉推进，避免跳变）
     const pw1 = snap.pw[0] || [];
     player.weapons.length = pw1.length;
     for (let i = 0; i < pw1.length; i++) {
       const d = pw1[i];
       let w = player.weapons[i];
-      if (!w) { w = {}; player.weapons[i] = w; }
-      w.key = d[0]; w.lv = d[1]; w.rot = d[2] || 0; w.cd = d[3] || 0; w.tick = 0;
+      if (!w) { w = {}; player.weapons[i] = w; w.rot = U.rand(TAU); w.cd = 0.3; w.tick = 0; }
+      w.key = d[0]; w.lv = d[1];
     }
-    // P2（仅联机模式存在）
+    // P2（自机）：位置信任本地预测，仅在明显失步时校正（冲刺中除外）
     if (this.p2) {
       const d2 = snap.p[1];
-      this.p2.x = d2[0]; this.p2.y = d2[1]; this.p2.hp = d2[2]; this.p2.maxHp = d2[3];
+      this.p2.hp = d2[2]; this.p2.maxHp = d2[3];
       this.p2.alive = !!d2[4]; this.p2.iTime = d2[5] ? 0.3 : -1;
-      this.p2.level = d2[6];
-      // P2 weapons（复用对象减少 GC）
+      this.p2.level = d2[6]; this.p2.xp = d2[7] || 0; this.p2.xpNext = d2[8] || this.p2.xpNext;
+      if (this.p2.dashT <= 0) {
+        const dx = d2[0] - this.p2.x, dy = d2[1] - this.p2.y;
+        if (dx * dx + dy * dy > 100 * 100) { this.p2.x = d2[0]; this.p2.y = d2[1]; }
+      }
+      // P2 weapons：只同步 key/lv（cd 由本地模拟推进，保证能正常开火）
       const pw2 = snap.pw[1] || [];
       this.p2.weapons.length = pw2.length;
       for (let i = 0; i < pw2.length; i++) {
         const d = pw2[i];
         let w = this.p2.weapons[i];
-        if (!w) { w = {}; this.p2.weapons[i] = w; }
-        w.key = d[0]; w.lv = d[1]; w.rot = d[2] || 0; w.cd = d[3] || 0; w.tick = 0;
+        if (!w) { w = {}; this.p2.weapons[i] = w; w.rot = U.rand(TAU); w.cd = 0.3; w.tick = 0; }
+        w.key = d[0]; w.lv = d[1];
       }
     }
-    // Enemies
-    const oldLen = enemies.length;
-    enemies.length = snap.e.length;
-    for (let i = 0; i < snap.e.length; i++) {
-      const d = snap.e[i];
-      let e = i < oldLen ? enemies[i] : null;
-      if (!e) { e = {}; enemies[i] = e; }
-      e.x = d[0]; e.y = d[1]; e.hp = d[2]; e.r = d[3]; e.type = SNAP_TYPE_NAMES[d[4]]; e.elite = !!d[5];
-      e.boss = !!d[6]; e.flash = d[7] ? 0.08 : 0; e.col = d[8]; e.dead = false;
-      e.maxHp = e.maxHp || d[2];
-    }
-    // Bullets
-    bullets.length = snap.b.length;
-    for (let i = 0; i < snap.b.length; i++) {
-      const d = snap.b[i];
-      let b = bullets[i];
-      if (!b) { b = { hit: null, life: 1, pierce: 0, dmg: 0, col: '#7ef9ff' }; bullets[i] = b; }
-      b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3];
-    }
-    // Enemy bullets
-    ebullets.length = snap.eb.length;
-    for (let i = 0; i < snap.eb.length; i++) {
-      const d = snap.eb[i];
-      let b = ebullets[i];
-      if (!b) { b = { life: 7, dmg: 0 }; ebullets[i] = b; }
-      b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3]; b.r = d[4]; b.col = SNAP_COL_NAMES[d[5]] || '#ff5ecf';
-    }
-    // Gems
-    gems.length = snap.g.length;
-    for (let i = 0; i < snap.g.length; i++) {
-      const d = snap.g[i];
-      let g = gems[i];
-      if (!g) { g = { phase: Math.random() * TAU, mag: false, val: 1 }; gems[i] = g; }
-      g.x = d[0]; g.y = d[1]; g.tier = d[2];
-    }
+    // 武器构成变化时刷新 HUD 武器栏
+    const pwSig = JSON.stringify(snap.pw);
+    if (pwSig !== this._pwSig) { this._pwSig = pwSig; UI.weaponsDirty = true; }
+    // 以下实体均按稳定 id 同步（_syncById）：身份一致，插值不会串位
+    // Enemies：x/y 为显示位置（插值），tx/ty 为快照目标
+    this._syncById(snap.e, this._enemyPool, (d) => ({ x: d[0], y: d[1], tx: d[0], ty: d[1], dead: false }),
+      (e, d) => {
+        e.tx = d[0]; e.ty = d[1];
+        e.hp = d[2]; e.type = SNAP_TYPE_NAMES[d[3]]; e.elite = !!d[4];
+        e.boss = !!d[5]; e.flash = d[6] ? 0.08 : 0; e.dead = false;
+        e.r = ENEMY_TYPES[e.type].r * (e.elite ? 1.55 : 1);
+        e.col = ENEMY_TYPES[e.type].col;
+        e.maxHp = e.maxHp || e.hp;
+      }, enemies);
+    // Bullets：按速度推算（直线弹道，位置即目标）
+    this._syncById(snap.b, this._bulletPool,
+      () => ({ hit: null, life: 1, pierce: 0, dmg: 0, col: '#7ef9ff' }),
+      (b, d) => { b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3]; }, bullets);
+    // Missiles：按速度推算 + 本地追踪
+    this._syncById(snap.m, this._missilePool,
+      () => ({ target: null, life: 4, trailT: 0, dmg: 0, aoe: 0 }),
+      (m, d) => { m.x = d[0]; m.y = d[1]; m.vx = d[2]; m.vy = d[3]; }, missiles);
+    // Enemy bullets：按速度推算
+    this._syncById(snap.eb, this._ebulletPool,
+      () => ({ life: 7, dmg: 0 }),
+      (b, d) => { b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3]; b.r = d[4]; b.col = SNAP_COL_NAMES[d[5]] || '#ff5ecf'; }, ebullets);
+    // Gems：平滑插值
+    this._syncById(snap.g, this._gemPool,
+      (d) => ({ phase: Math.random() * TAU, mag: false, val: 1, x: d[0], y: d[1], tx: d[0], ty: d[1] }),
+      (g, d) => { g.tx = d[0]; g.ty = d[1]; g.tier = d[2]; }, gems);
+    // Pickups（静态，无插值需求）
+    this._syncById(snap.pk, this._pickupPool,
+      () => ({ phase: U.rand(TAU) }),
+      (pk, d) => { pk.x = d[0]; pk.y = d[1]; pk.type = d[2] ? 'nuke' : 'heart'; }, pickups);
     // Boss bar
     if (snap.bh > 0) {
       if (!this.boss) { const eb = {}; eb.hp = snap.bh; eb.maxHp = snap.bm; eb.dead = false; this.boss = eb; }
       else { this.boss.hp = snap.bh; this.boss.maxHp = snap.bm; this.boss.dead = false; }
     } else { this.boss = null; }
+  },
+
+  /** 快照实体同步：按 id 复用对象，身份稳定（避免主机 swap-pop 让插值串位）。
+   *  snapArr 为快照数组（末位为 id），pool 为 id→实体 Map，
+   *  createFn/applyFn 负责建实体/写字段，outArr 输出绘制用数组。 */
+  _syncById(snapArr, pool, createFn, applyFn, outArr) {
+    outArr.length = snapArr.length;
+    const seen = new Set();
+    for (let i = 0; i < snapArr.length; i++) {
+      const d = snapArr[i];
+      const id = d[d.length - 1];
+      let e = pool.get(id);
+      if (!e) { e = createFn(d); e.id = id; pool.set(id, e); }
+      applyFn(e, d);
+      seen.add(id);
+      outArr[i] = e;
+    }
+    // 清理快照中已消失的实体
+    for (const id of pool.keys()) {
+      if (!seen.has(id)) pool.delete(id);
+    }
+  },
+
+  /** 客机：快照实体指数插值（平滑快照造成的跳变） */
+  smoothRemote(dt) {
+    const k = Math.min(1, dt * 22);
+    for (const e of enemies) {
+      e.x += (e.tx - e.x) * k;
+      e.y += (e.ty - e.y) * k;
+    }
+    for (const g of gems) {
+      g.x += (g.tx - g.x) * k;
+      g.y += (g.ty - g.y) * k;
+    }
+    if (player.tx !== undefined) {
+      player.x += (player.tx - player.x) * k;
+      player.y += (player.ty - player.y) * k;
+    }
+    // 远端 P1 武器旋转本地推进（视觉连续，避免快照跳变；
+    // P2 自机的旋转已由本地 WeaponSys.update 推进，此处不能重复）
+    for (const w of player.weapons) {
+      const S = WeaponSys.stats(w);
+      if (w.key === 'orbs') w.rot += S.spd * dt;
+      else if (w.key === 'laser') w.rot += 1.5 * dt;
+    }
   },
 
   /** 主机：双人模式的主更新入口 */
@@ -856,10 +922,12 @@ const Game = {
     // 构建空间哈希供武器/碰撞复用
     this.buildHash();
 
-    // P1 & P2 武器更新
+    // P1 & P2 武器更新（P2 发射的子弹/飞弹打上归属标记，快照跳过，由客机本地绘制）
     WeaponSys.update(dt);
     player = this.p2;
+    fireFromP2 = true;
     WeaponSys.update(dt);
+    fireFromP2 = false;
     player = p1;
 
     updateBullets(dt);
@@ -873,8 +941,8 @@ const Game = {
     UI.updateHUD();
     UI.updateP2HUD();
 
-    // 发送快照
-    if ((this._snapTick = (this._snapTick + 1) % 3) === 0) {
+    // 发送快照（每 2 帧 ≈30Hz，配合客机插值保证流畅）
+    if ((this._snapTick = (this._snapTick + 1) % 2) === 0) {
       Net.send({ type: 'snap', ...this.serializeState() });
     }
 
@@ -963,34 +1031,51 @@ const Game = {
     }
   },
 
-  /** 双人升级流程 */
+  /** 双人升级流程：按升级归属队列轮流发放卡片。
+   *  卡片只发给本轮归属方（P1 的轮在主机、P2 的轮在客机），另一方显示等待提示。 */
   openLevelUpMulti() {
+    if (this._levelQueue.length === 0) return;
     this.pendingLevels--;
-    this._levelUpPlayer = 0; // P1 always picks first
+    this._levelUpPlayer = this._levelQueue.shift();
+    const pp = this._levelUpPlayer === 1 ? this.p2 : player;
+    const orig = player;
+    player = pp;
     this.state = 'levelup';
     AudioSys.levelup(); AudioSys.duck(0.12);
-    FX.ring(player.x, player.y, '#7ef9ff', 140, 4);
+    FX.ring(pp.x, pp.y, '#7ef9ff', 140, 4);
     const opts = rollUpgrades();
-    // 发送升级选项给客机
-    Net.send({ type: 'lvup', who: 1, cards: opts.map(o => upgradeCardMeta(o)) });
-    UI.showUpgrades(opts);
+    this._levelOpts = opts;   // 独立保存，等待提示/UI 状态不影响客机选卡
+    if (this._levelUpPlayer === 1) {
+      // P2（客机）的轮：卡片发给客机，主机等待
+      Net.send({ type: 'lvup', who: 2, cards: opts.map(o => upgradeCardMeta(o)) });
+      UI.showWaiting('客机正在选择升级…');
+    } else {
+      // P1（主机）的轮：卡片显示在主机，客机等待
+      Net.send({ type: 'lvup', who: 1, cards: [] });
+      UI.showUpgrades(opts);
+    }
+    player = orig;
   },
 
-  chooseUpgradeMulti(opt) {
+  /** 完成一轮升级选择：应用到归属玩家，推进下一轮或结束 */
+  finishLevelUpPick(opt) {
+    const pp = this._levelUpPlayer === 1 ? this.p2 : player;
+    const orig = player;
+    player = pp;
     applyUpgrade(opt);
-    // 通知客机选了哪张卡
+    player = orig;
+    UI._curOpts = null;
+    this._levelOpts = null;   // 防双方重复点击同一轮
     Net.send({ type: 'lvpick', i: opt._idx });
     if (this.pendingLevels > 0) {
-      this.pendingLevels--;
-      this.state = 'levelup';
-      AudioSys.levelup();
-      FX.ring(player.x, player.y, '#7ef9ff', 140, 4);
-      const opts2 = rollUpgrades();
-      Net.send({ type: 'lvup', who: 1, cards: opts2.map(o => upgradeCardMeta(o)) });
-      UI.showUpgrades(opts2);
+      this.openLevelUpMulti();
     } else {
       this.state = 'playing'; UI.showScreen(null); AudioSys.duck(0.3);
       Net.send({ type: 'lvdone' });
     }
+  },
+
+  chooseUpgradeMulti(opt) {
+    this.finishLevelUpPick(opt);
   },
 };

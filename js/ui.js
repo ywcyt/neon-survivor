@@ -170,6 +170,14 @@ const UI = {
     }
   },
 
+  /** 升级等待提示（本轮属于对方） */
+  showWaiting(txt) {
+    this._curOpts = null;
+    const wrap = this.els.cards;
+    wrap.innerHTML = `<div class="card card-wait"><div class="card-name">${txt}</div></div>`;
+    this.showScreen('levelup');
+  },
+
   /** 客机渲染主机发来的升级卡片 */
   showUpgradesRemote(cardMetas) {
     const opts = cardMetas;
