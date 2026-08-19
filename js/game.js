@@ -9,7 +9,7 @@ const SNAP_COL_NAMES = ['#ff5ecf', '#59f0ff', '#ffb454'];
 function snapWeapons(p) { return p.weapons.map(w => [w.key, w.lv, w.rot, w.cd]); }
 function snapPlayer(p) {
   return [p.x | 0, p.y | 0, Math.ceil(p.hp), p.maxHp, p.alive ? 1 : 0,
-    p.iTime > 0 ? 1 : 0, Math.round(p.level), p.xp | 0, p.xpNext | 0];
+    p.iTime > 0 ? 1 : 0, Math.round(p.level), p.xp | 0, p.xpNext | 0, p.angle];
 }
 
 const Game = {
@@ -772,14 +772,15 @@ const Game = {
     this.time = snap.t; this.wave = snap.w;
     this.score = snap.sc[0]; this.kills = snap.sc[1];
     this.combo = snap.co[0]; this.maxCombo = snap.co[1];
-    // P1（远端，平滑插值）
+    // P1（远端，平滑插值；角度也同步并插值，避免主机朝向固定）
     const d1 = snap.p[0];
     if (player.tx === undefined) { player.x = d1[0]; player.y = d1[1]; }
     player.tx = d1[0]; player.ty = d1[1];
     player.hp = d1[2]; player.maxHp = d1[3];
     player.alive = !!d1[4]; player.iTime = d1[5] ? 0.3 : -1;
     player.level = d1[6]; player.xp = d1[7] || 0; player.xpNext = d1[8] || player.xpNext;
-    player.angle = 0;
+    if (player.angleT === undefined) player.angle = d1[9] || 0;
+    player.angleT = d1[9] || 0;
     // P1 weapons：只同步 key/lv，rot/cd/tick 保留本地（纯视觉推进，避免跳变）
     const pw1 = snap.pw[0] || [];
     player.weapons.length = pw1.length;
@@ -885,6 +886,7 @@ const Game = {
     if (player.tx !== undefined) {
       player.x += (player.tx - player.x) * k;
       player.y += (player.ty - player.y) * k;
+      player.angle = U.lerpAngle(player.angle, player.angleT, k);
     }
     // 远端 P1 武器旋转本地推进（视觉连续，避免快照跳变；
     // P2 自机的旋转已由本地 WeaponSys.update 推进，此处不能重复）
