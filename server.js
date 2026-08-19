@@ -3,9 +3,20 @@
 const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3456');
-const wss = new WebSocketServer({ port: PORT });
+const MAX_MSG = 65536;               // 单条消息上限（字节），防恶意洪泛
+const wss = new WebSocketServer({ port: PORT, maxPayload: MAX_MSG });
 
 console.log(`⚡ Neon Survivor LAN → ws://localhost:${PORT}`);
+
+// 心跳：清理网络异常但未触发 close 的死连接（浏览器会自动回 pong）
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 30000);
+wss.on('close', () => clearInterval(heartbeat));
 
 // 房间管理
 const rooms = new Map();  // code → { host, guest }
@@ -49,7 +60,11 @@ wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   console.log(`  ✓ 连接: ${ip}  (${wss.clients.size} 在线)`);
 
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
+    if (raw.length > MAX_MSG) { ws.terminate(); return; }   // 超限直接断开
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
 

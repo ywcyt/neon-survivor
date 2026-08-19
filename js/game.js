@@ -1,5 +1,17 @@
 'use strict';
 /* ============ 游戏主逻辑 ============ */
+
+/* 快照序列化常量（模块级，避免每次 serializeState 重建 Map/数组） */
+const SNAP_TYPE_IDX = { chaser: 0, darter: 1, splitter: 2, mini: 3, tank: 4, shooter: 5, boss: 6 };
+const SNAP_COL_IDX = { '#ff5ecf': 0, '#59f0ff': 1, '#ffb454': 2 };
+const SNAP_TYPE_NAMES = ['chaser', 'darter', 'splitter', 'mini', 'tank', 'shooter', 'boss'];
+const SNAP_COL_NAMES = ['#ff5ecf', '#59f0ff', '#ffb454'];
+function snapWeapons(p) { return p.weapons.map(w => [w.key, w.lv, w.rot, w.cd]); }
+function snapPlayer(p) {
+  return [p.x | 0, p.y | 0, Math.ceil(p.hp), p.maxHp, p.alive ? 1 : 0,
+    p.iTime > 0 ? 1 : 0, Math.round(p.level)];
+}
+
 const Game = {
   state: 'menu',
   time: 0, elapsed: 0,
@@ -11,6 +23,7 @@ const Game = {
   pickStreak: 0, pickT: 0,
   best: { score: 0, time: 0 },
   _hash: new Map(),
+  _hashDirty: false,   // 帧内新生成敌人（分裂/召唤）后置脏，areaDamage 需重建
   _uiTick: 0,
   CELL: 96,
   // 多人模式
@@ -202,6 +215,13 @@ const Game = {
       updateMissiles(rdt);
       // 更新本地粒子特效
       FX.update(rdt);
+      // 客机 HUD：显示自己的状态（player 是主机 P1，需临时 swap 到自己的船）
+      if ((this._uiTick = (this._uiTick + 1) % 3) === 0) {
+        const origPlayer = player;
+        if (this.p2) player = this.p2;
+        UI.updateHUD();
+        player = origPlayer;
+      }
       return;
     }
 
@@ -347,6 +367,7 @@ const Game = {
       if (!arr) { arr = []; this._hash.set(k, arr); }
       arr.push(e);
     }
+    this._hashDirty = false;
   },
 
   queryCircle(x, y, r, cb) {
@@ -478,7 +499,9 @@ const Game = {
   },
 
   areaDamage(x, y, r, dmg, kb = 0) {
-    this.buildHash();
+    // 帧内哈希通常仍然有效（敌人只在 updateEnemies 阶段移动），
+    // 仅当本帧生成过新敌人（分裂/召唤）时才重建，避免每颗飞弹都 O(n) 重建
+    if (this._hashDirty) this.buildHash();
     this.queryCircle(x, y, r, (e) => {
       this.damageEnemy(e, dmg, { kb, ax: x, ay: y });
     });
@@ -710,25 +733,20 @@ const Game = {
 
   /** 快照序列化（主机 → 客机） */
   serializeState() {
-    const TYPE_IDX = { chaser:0, darter:1, splitter:2, mini:3, tank:4, shooter:5, boss:6 };
-    const COL_IDX = { '#ff5ecf':0, '#59f0ff':1, '#ffb454':2 };
-    const pw = (p) => p.weapons.map(w => [w.key, w.lv, w.rot, w.cd]);
-    const pp = (p) => [p.x|0, p.y|0, Math.ceil(p.hp), p.maxHp, p.alive ? 1 : 0,
-      p.iTime > 0 ? 1 : 0, Math.round(p.level)];
     const snap = {
       t: this.time, w: this.wave, sc: [this.score, this.kills], co: [this.combo, this.maxCombo],
-      p: [pp(player), pp(this.p2)],
-      pw: [pw(player), pw(this.p2)],
+      p: [snapPlayer(player), snapPlayer(this.p2)],
+      pw: [snapWeapons(player), snapWeapons(this.p2)],
       e: [], b: [], eb: [], g: [],
       bh: this.boss && !this.boss.dead ? this.boss.hp : 0,
       bm: this.boss && !this.boss.dead ? this.boss.maxHp : 0,
     };
     for (const e of enemies) {
       if (e.dead) continue;
-      snap.e.push([e.x|0, e.y|0, Math.ceil(e.hp), e.r, TYPE_IDX[e.type] || 0, e.elite ? 1 : 0, e.boss ? 1 : 0, e.flash > 0 ? 1 : 0, e.col]);
+      snap.e.push([e.x|0, e.y|0, Math.ceil(e.hp), e.r, SNAP_TYPE_IDX[e.type] || 0, e.elite ? 1 : 0, e.boss ? 1 : 0, e.flash > 0 ? 1 : 0, e.col]);
     }
     for (const b of bullets) snap.b.push([b.x|0, b.y|0, b.vx|0, b.vy|0]);
-    for (const b of ebullets) snap.eb.push([b.x|0, b.y|0, b.vx|0, b.vy|0, b.r, COL_IDX[b.col] || 0]);
+    for (const b of ebullets) snap.eb.push([b.x|0, b.y|0, b.vx|0, b.vy|0, b.r, SNAP_COL_IDX[b.col] || 0]);
     for (const g of gems) snap.g.push([g.x|0, g.y|0, g.tier]);
     return snap;
   },
@@ -770,15 +788,13 @@ const Game = {
       }
     }
     // Enemies
-    const TYPE_NAMES = ['chaser','darter','splitter','mini','tank','shooter','boss'];
-    const COL_NAMES = ['#ff5ecf','#59f0ff','#ffb454'];
     const oldLen = enemies.length;
     enemies.length = snap.e.length;
     for (let i = 0; i < snap.e.length; i++) {
       const d = snap.e[i];
       let e = i < oldLen ? enemies[i] : null;
       if (!e) { e = {}; enemies[i] = e; }
-      e.x = d[0]; e.y = d[1]; e.hp = d[2]; e.r = d[3]; e.type = TYPE_NAMES[d[4]]; e.elite = !!d[5];
+      e.x = d[0]; e.y = d[1]; e.hp = d[2]; e.r = d[3]; e.type = SNAP_TYPE_NAMES[d[4]]; e.elite = !!d[5];
       e.boss = !!d[6]; e.flash = d[7] ? 0.08 : 0; e.col = d[8]; e.dead = false;
       e.maxHp = e.maxHp || d[2];
     }
@@ -796,7 +812,7 @@ const Game = {
       const d = snap.eb[i];
       let b = ebullets[i];
       if (!b) { b = { life: 7, dmg: 0 }; ebullets[i] = b; }
-      b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3]; b.r = d[4]; b.col = COL_NAMES[d[5]] || '#ff5ecf';
+      b.x = d[0]; b.y = d[1]; b.vx = d[2]; b.vy = d[3]; b.r = d[4]; b.col = SNAP_COL_NAMES[d[5]] || '#ff5ecf';
     }
     // Gems
     gems.length = snap.g.length;
@@ -897,7 +913,8 @@ const Game = {
       if (removed) continue;
     }
     // 环刃
-    for (const pp of [player, this.p2]) {
+    const ppList = [player, this.p2];
+    for (const pp of ppList) {
       for (let wi = 0; wi < pp.weapons.length; wi++) {
         const w = pp.weapons[wi];
         if (w.key !== 'orbs') continue;
@@ -914,7 +931,7 @@ const Game = {
       }
     }
     // 敌人 → 双玩家
-    for (const pp of [player, this.p2]) {
+    for (const pp of ppList) {
       if (!pp.alive) continue;
       this.queryCircle(pp.x, pp.y, 14, (e) => {
         if (pp.iTime > 0) return false;

@@ -5,7 +5,6 @@ const enemies = [];
 const bullets = [];
 const ebullets = [];
 const gems = [];
-let _gemWrite = 0;   // 环形写入索引，避免 O(n) shift
 const pickups = [];
 const missiles = [];
 
@@ -260,7 +259,10 @@ function drawRemotePlayer(ctx, p) {
 }
 
 /* ---- 双人拾取 ---- */
+const _PLAYERS = [null, null];   // 复用数组，避免每帧每宝石分配 [player, p2]
+
 function updateGemsMulti(dt) {
+  _PLAYERS[0] = player; _PLAYERS[1] = Game.p2;
   for (let i = gems.length - 1; i >= 0; i--) {
     const g = gems[i];
     // 吸引到最近玩家
@@ -281,7 +283,7 @@ function updateGemsMulti(dt) {
     g.x += g.vx * dt; g.y += g.vy * dt;
     // 检查两个玩家
     let collected = false;
-    for (const pp of [player, Game.p2]) {
+    for (const pp of _PLAYERS) {
       if (!pp || !pp.alive) continue;
       if (U.dist2(g.x, g.y, pp.x, pp.y) < 22 * 22) {
         Game.collectGem(g); collected = true; break;
@@ -292,9 +294,10 @@ function updateGemsMulti(dt) {
 }
 
 function updatePickupsMulti(dt) {
+  _PLAYERS[0] = player; _PLAYERS[1] = Game.p2;
   for (let i = pickups.length - 1; i >= 0; i--) {
     const pk = pickups[i];
-    for (const pp of [player, Game.p2]) {
+    for (const pp of _PLAYERS) {
       if (!pp || !pp.alive) continue;
       if (U.dist2(pk.x, pk.y, pp.x, pp.y) < 28 * 28) {
         Game.applyPickup(pk.type, pk.x, pk.y);
@@ -344,6 +347,8 @@ function spawnEnemy(type, x, y, elite = false, hpMul = 1, dmgMul = 1) {
   };
   e.maxHp = e.hp;
   enemies.push(e);
+  // 通知 Game 空间哈希已过期（分裂/召唤产生的敌人不在哈希内）
+  if (typeof Game !== 'undefined') Game._hashDirty = true;
   return e;
 }
 
@@ -848,15 +853,10 @@ const GEM_TIERS = [
 function spawnGem(x, y, val) {
   const tier = val >= 20 ? 2 : (val >= 5 ? 1 : 0);
   const a = U.rand(TAU), s = U.rand(30, 110);
-  const g = { x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
-    val, tier, mag: false, phase: U.rand(TAU) };
-  // 环形缓冲区写入，避免 O(n) shift
-  if (gems.length < 381) {
-    gems.push(g);
-  } else {
-    gems[_gemWrite % 381] = g;
-    _gemWrite++;
-  }
+  // 上限保护：超限丢弃新宝石（swap-pop 删除与环形覆盖会互相冲突，故只 push）
+  if (gems.length >= 381) return;
+  gems.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+    val, tier, mag: false, phase: U.rand(TAU) });
 }
 
 function dropGems(x, y, total) {

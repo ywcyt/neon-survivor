@@ -95,6 +95,8 @@ const Input = {
     dashBtn.addEventListener('click', (e) => { e.preventDefault(); this.dashQueued = true; });
   },
 
+  _mvCache: { x: 0, y: 0 },
+
   getMove() {
     let x = 0, y = 0;
     if (this.keys.KeyW || this.keys.ArrowUp) y -= 1;
@@ -104,7 +106,9 @@ const Input = {
     if (this.joy.active) { x = this.joy.x; y = this.joy.y; }
     const l = Math.hypot(x, y);
     if (l > 1) { x /= l; y /= l; }
-    return { x, y };
+    this._mvCache.x = x;
+    this._mvCache.y = y;
+    return this._mvCache;
   },
 
   consumeDash() {
